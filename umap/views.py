@@ -1,8 +1,10 @@
+import io
 import json
 import mimetypes
 import os
 import re
 import socket
+import zipfile
 from datetime import datetime, timedelta
 from http.client import InvalidURL
 from io import BytesIO
@@ -288,18 +290,42 @@ class UserDashboard(PaginatorMixin, DetailView, SearchMixin):
         return qs.order_by("-modified_at")
 
     def get_context_data(self, **kwargs):
-        kwargs.update(
-            {
-                "q": self.request.GET.get("q"),
-                "maps": self.paginate(
-                    self.get_maps(), settings.UMAP_MAPS_PER_PAGE_OWNER
-                ),
-            }
-        )
+        page = self.paginate(self.get_maps(), settings.UMAP_MAPS_PER_PAGE_OWNER)
+        kwargs.update({"q": self.request.GET.get("q"), "maps": page})
         return super().get_context_data(**kwargs)
 
 
 user_dashboard = UserDashboard.as_view()
+
+
+class UserDownload(DetailView, SearchMixin):
+    model = User
+
+    def get_object(self):
+        return self.get_queryset().get(pk=self.request.user.pk)
+
+    def get_maps(self):
+        qs = Map.objects.filter(id__in=self.request.GET.getlist("map_id"))
+        qs = qs.filter(owner=self.object).union(qs.filter(editors=self.object))
+        return qs.order_by("-modified_at")
+
+    def render_to_response(self, context, *args, **kwargs):
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            for map_ in self.get_maps():
+                umapjson = map_.generate_umapjson(self.request)
+                geojson_file = io.StringIO(json.dumps(umapjson))
+                file_name = f"umap_backup_{map_.slug}_{map_.pk}.umap"
+                zip_file.writestr(file_name, geojson_file.getvalue())
+
+        response = HttpResponse(zip_buffer.getvalue(), content_type="application/zip")
+        response[
+            "Content-Disposition"
+        ] = 'attachment; filename="umap_backup_complete.zip"'
+        return response
+
+
+user_download = UserDownload.as_view()
 
 
 class MapsShowCase(View):
@@ -455,7 +481,8 @@ class MapDetailMixin:
             if domain and "{" not in domain:
                 context["preconnect_domains"] = [f"//{domain}"]
 
-    def get_map_properties(self):
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
         user = self.request.user
         properties = {
             "urls": _urls_for_js(),
@@ -485,17 +512,6 @@ class MapDetailMixin:
         if self.get_short_url():
             properties["shortUrl"] = self.get_short_url()
 
-        if not user.is_anonymous:
-            properties["user"] = {
-                "id": user.pk,
-                "name": str(user),
-                "url": reverse("user_dashboard"),
-            }
-        return properties
-
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        properties = self.get_map_properties()
         if settings.USE_I18N:
             lang = settings.LANGUAGE_CODE
             # Check attr in case the middleware is not active
@@ -505,13 +521,19 @@ class MapDetailMixin:
             locale = to_locale(lang)
             properties["locale"] = locale
             context["locale"] = locale
-        geojson = self.get_geojson()
-        if "properties" not in geojson:
-            geojson["properties"] = {}
-        geojson["properties"].update(properties)
-        geojson["properties"]["datalayers"] = self.get_datalayers()
-        context["map_settings"] = json.dumps(geojson, indent=settings.DEBUG)
-        self.set_preconnect(geojson["properties"], context)
+        if not user.is_anonymous:
+            properties["user"] = {
+                "id": user.pk,
+                "name": str(user),
+                "url": reverse("user_dashboard"),
+            }
+        map_settings = self.get_geojson()
+        if "properties" not in map_settings:
+            map_settings["properties"] = {}
+        map_settings["properties"].update(properties)
+        map_settings["properties"]["datalayers"] = self.get_datalayers()
+        context["map_settings"] = json.dumps(map_settings, indent=settings.DEBUG)
+        self.set_preconnect(map_settings["properties"], context)
         return context
 
     def get_datalayers(self):
@@ -637,18 +659,8 @@ class MapDownload(DetailView):
         return reverse("map_download", args=(self.object.pk,))
 
     def render_to_response(self, context, *args, **kwargs):
-        geojson = self.object.settings
-        geojson["type"] = "umap"
-        geojson["uri"] = self.request.build_absolute_uri(self.object.get_absolute_url())
-        datalayers = []
-        for datalayer in self.object.datalayer_set.all():
-            with open(datalayer.geojson.path, "rb") as f:
-                layer = json.loads(f.read())
-            if datalayer.settings:
-                layer["_umap_options"] = datalayer.settings
-            datalayers.append(layer)
-        geojson["layers"] = datalayers
-        response = simple_json_response(**geojson)
+        umapjson = self.object.generate_umapjson(self.request)
+        response = simple_json_response(**umapjson)
         response[
             "Content-Disposition"
         ] = f'attachment; filename="umap_backup_{self.object.slug}.umap"'
@@ -711,15 +723,6 @@ class MapViewGeoJSON(MapView):
 
 class MapNew(MapDetailMixin, TemplateView):
     template_name = "umap/map_detail.html"
-
-
-class MapPreview(MapDetailMixin, TemplateView):
-    template_name = "umap/map_detail.html"
-
-    def get_map_properties(self):
-        properties = super().get_map_properties()
-        properties["preview"] = True
-        return properties
 
 
 class MapCreate(FormLessEditMixin, PermissionsMixin, CreateView):
@@ -845,7 +848,11 @@ class MapDelete(DeleteView):
         if not self.object.can_delete(self.request.user, self.request):
             return HttpResponseForbidden(_("Only its owner can delete the map."))
         self.object.delete()
-        return simple_json_response(redirect="/")
+        home_url = reverse("home")
+        if is_ajax(self.request):
+            return simple_json_response(redirect=home_url)
+        else:
+            return HttpResponseRedirect(form.data.get("next") or home_url)
 
 
 class MapClone(PermissionsMixin, View):
@@ -857,7 +864,10 @@ class MapClone(PermissionsMixin, View):
             return HttpResponseForbidden()
         owner = self.request.user if self.request.user.is_authenticated else None
         self.object = kwargs["map_inst"].clone(owner=owner)
-        response = simple_json_response(redirect=self.object.get_absolute_url())
+        if is_ajax(self.request):
+            response = simple_json_response(redirect=self.object.get_absolute_url())
+        else:
+            response = HttpResponseRedirect(self.object.get_absolute_url())
         if not self.request.user.is_authenticated:
             key, value = self.object.signed_cookie_elements
             response.set_signed_cookie(
